@@ -489,6 +489,7 @@ extern "C" uint32_t runtime_fp_query_pc(uint32_t pc, uint32_t max_hits,
 // Read-only current recompiled-CPU PC, for always-on observability taps that
 // live outside the armv4t lib (the gba_io MMIO write-trace ring).
 extern "C" uint32_t runtime_current_pc(void) { return g_cpu.R[15]; }
+extern "C" uint32_t runtime_current_lr(void) { return g_cpu.R[14]; }
 
 // ── IRQ-vector log (MC-HP-002) ─────────────────────────────────────
 // A dedicated, always-on, cycle-stamped log of EVERY IRQ vectoring. The

@@ -30,6 +30,23 @@ struct RecompRuntimeUi;
 
 namespace gbarecomp {
 
+#if defined(__ANDROID__)
+// Takes the pending item ID once, or returns -1 if the Android UI posted none.
+int thor_take_item_request();
+
+struct ThorEquipmentRequest {
+    std::int32_t sequence;
+    std::int32_t character;
+    std::int32_t category;
+    std::int32_t record; // -1 for Unequip
+    std::int32_t item;
+    std::int32_t owner;
+    std::uint32_t state_epoch;
+};
+bool thor_take_equipment_request(ThorEquipmentRequest& request);
+void thor_finish_equipment_request(std::int32_t sequence, int result);
+#endif
+
 class HostOverlay;
 
 class HostWindow {

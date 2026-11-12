@@ -67,6 +67,15 @@ public class GbaSetupActivity extends Activity {
         return GbaGameActivity.class;
     }
 
+    /** Game-specific reviewed identity policy, without game facts in this shared shell. */
+    protected boolean isInstalledRomReady(File rom, GbaGameConfig game) {
+        return rom.isFile() && game.romSizeAccepted(rom.length());
+    }
+
+    protected void validateImportedRom(String sha1, long size) throws IOException { }
+
+    protected void onRomInstalled(File rom, String sha1, long size) { }
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -300,7 +309,7 @@ public class GbaSetupActivity extends Activity {
 
     private void refreshStatus() {
         biosReady = biosFile().isFile() && biosFile().length() == BIOS_SIZE;
-        romReady = romFile().isFile() && romFile().length() == config.romSize;
+        romReady = isInstalledRomReady(romFile(), config);
         setAssetStatus(romStatus, romButton, romReady, "ROM", true);
         setAssetStatus(biosStatus, biosButton, biosReady, "BIOS", config.biosRequired);
         playButton.setEnabled(ready());
@@ -370,7 +379,7 @@ public class GbaSetupActivity extends Activity {
     private void installVerifiedAsset(Uri uri, boolean bios)
             throws IOException, NoSuchAlgorithmException {
         String displayName = displayName(uri);
-        long expectedSize = bios ? BIOS_SIZE : config.romSize;
+        long expectedSize = bios ? BIOS_SIZE : java.util.Arrays.stream(config.romSizes).max().orElse(config.romSize);
         File destination = bios ? biosFile() : romFile();
         File directory = destination.getParentFile();
         if (directory != null && !directory.isDirectory() && !directory.mkdirs()) {
@@ -397,22 +406,31 @@ public class GbaSetupActivity extends Activity {
             throw error;
         }
         String actual = toHex(digest.digest());
-        boolean accepted = total == expectedSize &&
+        if (!bios) {
+            try {
+                validateImportedRom(actual, total);
+            } catch (IOException rejected) {
+                temporary.delete();
+                throw rejected;
+            }
+        }
+        boolean accepted = (bios ? total == BIOS_SIZE : config.romSizeAccepted(total)) &&
             (bios ? config.biosSha1.equals(actual) : config.romAccepted(actual));
         if (!accepted) {
             temporary.delete();
             throw new IOException(String.format(Locale.US,
-                "%s is not the supported clean %s dump.\n\nSize: %,d bytes (expected %,d)\nSHA-1: %s",
+                "%s is not the supported clean %s dump.\n\nSize: %,d bytes (maximum %,d)\nSHA-1: %s",
                 displayName, bios ? "GBA BIOS" : config.romLabel, total, expectedSize, actual));
         }
-        if (destination.exists() && !destination.delete()) {
+        try {
+            // Same-directory POSIX rename replaces atomically. A failed import leaves
+            // the previous player's file intact; never delete it before replacement.
+            android.system.Os.rename(temporary.getAbsolutePath(), destination.getAbsolutePath());
+        } catch (android.system.ErrnoException error) {
             temporary.delete();
-            throw new IOException("Could not replace the previously imported file.");
+            throw new IOException("Could not atomically replace the imported file.", error);
         }
-        if (!temporary.renameTo(destination)) {
-            copyFile(temporary, destination);
-            temporary.delete();
-        }
+        if (!bios) onRomInstalled(destination, actual, total);
     }
 
     private static void copyFile(File source, File destination) throws IOException {

@@ -24,6 +24,7 @@
         <meta-data android:name="gbarecomp.rom_label" android:value="${gbaRomLabel}" />
         <meta-data android:name="gbarecomp.rom_sha1" android:value="${gbaRomSha1}" />
         <meta-data android:name="gbarecomp.rom_size" android:value="${gbaRomSize}" />
+        <meta-data android:name="gbarecomp.rom_sizes" android:value="${gbaRomSizes}" />
         <meta-data android:name="gbarecomp.rom_file" android:value="${gbaRomFile}" />
         <meta-data android:name="gbarecomp.bios_required" android:value="${gbaBiosRequired}" />
         <meta-data android:name="gbarecomp.bios_sha1" android:value="${gbaBiosSha1}" />

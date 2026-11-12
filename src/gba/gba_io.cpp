@@ -1,3 +1,10 @@
+#if defined(__ANDROID__)
+#include <android/log.h>
+#define THOR_DMA_LOG(...) __android_log_print(ANDROID_LOG_INFO, "THOR_SCOUTER_DMA", __VA_ARGS__)
+#else
+#define THOR_DMA_LOG(...) std::fprintf(stderr, __VA_ARGS__)
+#endif
+
 // gba_io.cpp — see gba_io.h.
 
 #include "gba_io.h"
@@ -301,11 +308,16 @@ void GbaIo::run_immediate_dma(int channel) {
     static long long dma_watch = -2;
     if (dma_watch == -2) {
         const char* e = std::getenv("GBARECOMP_DMA_WATCH_ADDR");
+        #if defined(__ANDROID__)
+        dma_watch = e ? static_cast<long long>(std::strtoull(e, nullptr, 0)) : 0x0600F000LL;
+#else
         dma_watch = e ? static_cast<long long>(std::strtoull(e, nullptr, 0)) : -1;
+#endif
     }
 
     uint32_t s = sad;
     uint32_t d = dad;
+    bool scouter_logged = false;
 #if defined(GBARECOMP_DMA_RAM_HLE)
     const bool copied = dma_watch < 0 && src_ctrl == 0 &&
         (dest_ctrl == 0 || dest_ctrl == 3) && word_count >= 4u &&
@@ -320,9 +332,10 @@ void GbaIo::run_immediate_dma(int channel) {
         } else {
             bus_->write16(d, bus_->read16(s));
         }
-        if (dma_watch >= 0 && d == static_cast<uint32_t>(dma_watch)) {
+        if (dma_watch >= 0 && !scouter_logged && d >= static_cast<uint32_t>(dma_watch) && d < static_cast<uint32_t>(dma_watch) + 0x800u) {
             uint32_t v = transfer_32 ? bus_->read32(d) : bus_->read16(d);
-            std::fprintf(stderr,
+            scouter_logged = true;
+            THOR_DMA_LOG(
                 "[dma-watch] ch=%d dad=0x%08X (hit 0x%08X) src=0x%08X val=0x%08X "
                 "size=%u word=%u/%u cnt_h=0x%04X\n",
                 channel, dad, d, s, v, step, k, word_count, cnt_h);
@@ -358,7 +371,11 @@ void GbaIo::run_timed_dma(int start_mode) {
     static long long dma_watch = -2;
     if (dma_watch == -2) {
         const char* e = std::getenv("GBARECOMP_DMA_WATCH_ADDR");
+        #if defined(__ANDROID__)
+        dma_watch = e ? static_cast<long long>(std::strtoull(e, nullptr, 0)) : 0x0600F000LL;
+#else
         dma_watch = e ? static_cast<long long>(std::strtoull(e, nullptr, 0)) : -1;
+#endif
     }
     for (int channel = 0; channel < 4; ++channel) {
         uint32_t base  = 0xB0u + static_cast<uint32_t>(channel) * 12u;
@@ -377,6 +394,7 @@ void GbaIo::run_timed_dma(int start_mode) {
         uint32_t s = dma_next_source_[channel] & align_mask;
         uint32_t d = dma_next_dest_[channel] & align_mask;
         dma_steal_cycles_ += dma_transfer_cost(s, d, transfer_32, word_count);
+        bool scouter_logged = false;
 #if defined(GBARECOMP_DMA_RAM_HLE)
         const bool copied = dma_watch < 0 && src_ctrl == 0 &&
             (dest_ctrl == 0 || dest_ctrl == 3) && word_count >= 4u &&
@@ -388,9 +406,10 @@ void GbaIo::run_timed_dma(int start_mode) {
         for (uint32_t k = 0; k < word_count; ++k) {
             if (transfer_32) bus_->write32(d, bus_->read32(s));
             else             bus_->write16(d, bus_->read16(s));
-            if (dma_watch >= 0 && d == static_cast<uint32_t>(dma_watch)) {
+            if (dma_watch >= 0 && !scouter_logged && d >= static_cast<uint32_t>(dma_watch) && d < static_cast<uint32_t>(dma_watch) + 0x800u) {
                 uint32_t v = transfer_32 ? bus_->read32(d) : bus_->read16(d);
-                std::fprintf(stderr,
+                scouter_logged = true;
+                THOR_DMA_LOG(
                     "[dma-watch:timed] mode=%d ch=%d dad=0x%08X src=0x%08X "
                     "val=0x%08X size=%u word=%u/%u cnt_h=0x%04X\n",
                     start_mode, channel, d, s, v, step, k, word_count, cnt_h);

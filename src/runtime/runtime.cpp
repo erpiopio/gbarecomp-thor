@@ -63,6 +63,11 @@
 #include <functional>
 #include <cstdint>
 #include <atomic>
+#if defined(__ANDROID__)
+#include <jni.h>
+#include <android/log.h>
+#include "thor_scouter_map.h"
+#endif
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -78,6 +83,147 @@
 #include <string_view>
 #include <thread>
 #include <vector>
+
+#if defined(__ANDROID__)
+// Read-only snapshot, written by the game thread and copied by JNI.
+// Order: HP, max HP, EP, max EP, EXP, attack, Zenie.
+namespace {
+std::mutex g_thor_status_mutex;
+constexpr int kThorEquipmentCount = 250;
+constexpr int kThorEquipmentBase = 457;
+constexpr int kThorEffectiveStats = kThorEquipmentBase + 4 * kThorEquipmentCount;
+constexpr int kThorEquipmentEpoch = kThorEffectiveStats + 4;
+constexpr int kThorEquippedSlots = kThorEquipmentEpoch + 1;
+constexpr int kThorEquipmentResponse = kThorEquippedSlots + 4;
+constexpr int kThorGameplayReady = kThorEquipmentResponse + 2;
+constexpr int kThorStatusCount = kThorGameplayReady + 1;
+jint g_thor_status[kThorStatusCount] = {};
+bool g_thor_status_ready = false;
+constexpr int kThorMapCount = 11;
+jint g_thor_map[kThorMapCount] = {};
+bool g_thor_map_ready = false;
+std::vector<jint> g_thor_original_map = {0, 0, 0};
+
+// THOR_SCOUTER_CACHE: copia privada de VRAM y paleta.
+std::vector<uint8_t> g_thor_scouter_cache;
+constexpr std::size_t kThorScouterVramSize = 98304;
+constexpr std::size_t kThorScouterPalSize = 1024;
+constexpr std::size_t kThorScouterOamSize = 1024;
+constexpr std::size_t kThorScouterTotalSize =
+    kThorScouterVramSize + kThorScouterPalSize + kThorScouterOamSize;
+
+gbarecomp::ThorEquipmentRequest g_thor_equipment_pending{};
+std::chrono::steady_clock::time_point g_thor_equipment_deadline;
+jint g_thor_equipment_sequence = 0;
+jint g_thor_equipment_completed = 0;
+jint g_thor_equipment_result = 0;
+bool g_thor_equipment_in_flight = false;
+
+void thor_cancel_equipment_request_locked() {
+    if (g_thor_equipment_pending.sequence == 0) return;
+    g_thor_equipment_completed = g_thor_equipment_pending.sequence;
+    g_thor_equipment_result = 1;
+    g_thor_status[kThorEquipmentResponse] = g_thor_equipment_completed;
+    g_thor_status[kThorEquipmentResponse + 1] = g_thor_equipment_result;
+    g_thor_equipment_pending = {};
+}
+}
+
+extern "C" JNIEXPORT jintArray JNICALL
+Java_org_gbarecomp_GbaNative_getStatusSnapshot(JNIEnv* env, jclass) {
+    jint values[kThorStatusCount];
+    {
+        std::lock_guard<std::mutex> lock(g_thor_status_mutex);
+        if (!g_thor_status_ready) return nullptr;
+        if (std::chrono::steady_clock::now() >= g_thor_equipment_deadline)
+            thor_cancel_equipment_request_locked();
+        std::copy_n(g_thor_status, kThorStatusCount, values);
+    }
+    jintArray result = env->NewIntArray(kThorStatusCount);
+    if (result) env->SetIntArrayRegion(result, 0, kThorStatusCount, values);
+    return result;
+}
+
+extern "C" JNIEXPORT jintArray JNICALL
+Java_org_gbarecomp_GbaNative_getMapSnapshot(JNIEnv* env, jclass) {
+    jint values[kThorMapCount];
+    {
+        std::lock_guard<std::mutex> lock(g_thor_status_mutex);
+        if (!g_thor_map_ready) return nullptr;
+        std::copy_n(g_thor_map, kThorMapCount, values);
+    }
+    jintArray result = env->NewIntArray(kThorMapCount);
+    if (result)
+        env->SetIntArrayRegion(result, 0, kThorMapCount, values);
+    return result;
+}
+
+
+// Atomic read-only presentation, [revision, width, height, ARGB pixels].
+extern "C" JNIEXPORT jintArray JNICALL
+Java_org_gbarecomp_GbaNative_getOriginalScouterMap(
+        JNIEnv* env, jclass, jint revision) {
+    std::lock_guard<std::mutex> lock(g_thor_status_mutex);
+    if (g_thor_original_map[0] == revision) return nullptr;
+    jintArray result = env->NewIntArray(
+        static_cast<jsize>(g_thor_original_map.size()));
+    if (result) env->SetIntArrayRegion(result, 0,
+        static_cast<jsize>(g_thor_original_map.size()),
+        g_thor_original_map.data());
+    return result;
+}
+
+// THOR_SCOUTER_CACHE: lectura segura para Android.
+extern "C" JNIEXPORT jbyteArray JNICALL
+Java_org_gbarecomp_GbaNative_getScouterGraphics(JNIEnv* env, jclass) {
+    std::lock_guard<std::mutex> lock(g_thor_status_mutex);
+    if (g_thor_scouter_cache.empty()) return nullptr;
+
+    jbyteArray result = env->NewByteArray(
+        static_cast<jsize>(g_thor_scouter_cache.size()));
+    if (result)
+        env->SetByteArrayRegion(
+            result, 0, static_cast<jsize>(g_thor_scouter_cache.size()),
+            reinterpret_cast<const jbyte*>(g_thor_scouter_cache.data()));
+    return result;
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_org_gbarecomp_GbaNative_requestEquipmentChange(
+        JNIEnv*, jclass, jint character, jint category, jint record, jint item,
+        jint owner, jint state_epoch) {
+    if (character < 0 || character >= 8 || category < 0 || category >= 4 ||
+        record < -1 || record >= kThorEquipmentCount || item <= 0 || item >= 162 ||
+        owner < 0 || owner > 8) return 0;
+
+    std::lock_guard<std::mutex> lock(g_thor_status_mutex);
+    if (!g_thor_status_ready || g_thor_equipment_in_flight ||
+        g_thor_equipment_pending.sequence != 0) return 0;
+    if (g_thor_equipment_sequence == std::numeric_limits<jint>::max())
+        g_thor_equipment_sequence = 0;
+    g_thor_equipment_pending = {++g_thor_equipment_sequence, character, category,
+                                record, item, owner, static_cast<std::uint32_t>(state_epoch)};
+    g_thor_equipment_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    return g_thor_equipment_pending.sequence;
+}
+
+bool gbarecomp::thor_take_equipment_request(ThorEquipmentRequest& request) {
+    std::lock_guard<std::mutex> lock(g_thor_status_mutex);
+    if (std::chrono::steady_clock::now() >= g_thor_equipment_deadline)
+        thor_cancel_equipment_request_locked();
+    request = g_thor_equipment_pending;
+    g_thor_equipment_pending = {};
+    g_thor_equipment_in_flight = request.sequence != 0;
+    return g_thor_equipment_in_flight;
+}
+
+void gbarecomp::thor_finish_equipment_request(std::int32_t sequence, int result) {
+    std::lock_guard<std::mutex> lock(g_thor_status_mutex);
+    g_thor_equipment_completed = sequence;
+    g_thor_equipment_result = result;
+    g_thor_equipment_in_flight = false;
+}
+#endif
 
 // Authoritative IRQ-entry counter, incremented in runtime_irq (runtime_arm.cpp)
 // at the actual vectoring site. The TCP `counters` command surfaces it via
@@ -1493,7 +1639,16 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
     gba::g_ws_pillarbox_right = 0;
     g_runtime_fn_entry_hook = nullptr;
     g_runtime_thumb_alu_imm_override = nullptr;
-    g_runtime_bus_read_override = nullptr;
+    g_runtime_bus_read_override = opts.initial_bus_read_override;
+#if defined(__ANDROID__)
+    thor_take_item_request();
+    {
+        std::lock_guard<std::mutex> lock(g_thor_status_mutex);
+        thor_cancel_equipment_request_locked();
+        g_thor_status_ready = false;
+        g_thor_map_ready = false;
+    }
+#endif
     Args args;
 
     // Seed built-in defaults from the caller (the per-game runner).
@@ -1784,9 +1939,273 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
         opts.expose_cheats && cheat_engine.preset_count() > 0;
     const CheatMemory cheat_mem = make_bus_cheat_memory(bus);
     uint64_t cheat_last_frame = ~static_cast<uint64_t>(0);
+#if defined(__ANDROID__)
+    uint64_t thor_status_last_frame = ~static_cast<uint64_t>(0);
+    bool thor_probe_ready = false;
+    jint thor_probe_candidates[22] = {};
+    int thor_ready_field_frames = 0;
+
+    thor_scouter::Renderer thor_original_renderer;
+    std::vector<uint32_t> thor_original_pixels;
+
+    auto publish_thor_status = [&]() {
+        const uint64_t status_frame = ppu.frame_count();
+        if (status_frame != thor_status_last_frame) {
+            thor_status_last_frame = status_frame;
+            const auto thor_read = [&](uint32_t addr, uint8_t bits) -> uint32_t {
+                if (!cheat_mem.read16) return 0u;
+                const uint32_t low = cheat_mem.read16(cheat_mem.ctx, addr);
+                if (bits == 32)
+                    return low | (static_cast<uint32_t>(
+                        cheat_mem.read16(cheat_mem.ctx, addr + 2u)) << 16);
+                return low;
+            };
+            const uint32_t character = thor_read(0x03001068u, 16) & 0xFFu;
+            const uint32_t vitals = 0x03001576u + (character < 9u ? character : 0u) * 0x68u;
+            jint values[kThorStatusCount] = {
+                static_cast<jint>(thor_read(vitals, 16)),
+                static_cast<jint>(thor_read(vitals + 2u, 16)),
+                static_cast<jint>(thor_read(vitals + 4u, 16)),
+                static_cast<jint>(thor_read(vitals + 6u, 16)),
+                static_cast<jint>(thor_read(vitals + 0xEu, 32)),
+                static_cast<jint>(thor_read( 0x03001588u, 16)),
+                static_cast<jint>(thor_read( 0x0300155Cu, 32))
+            };
+            // Diagnóstico temporal: 64 palabras consecutivas de RAM.
+            // Los primeros 7 valores mantienen su formato original.
+            for (int i = 0; i < 64; ++i)
+                values[7 + i] = static_cast<jint>(
+                    thor_read(0x03001560u + static_cast<uint32_t>(i * 2), 16));
+
+            // 0x03000F94: contador de tiempo, formato por verificar.
+            values[71] = static_cast<jint>(
+                thor_read(0x03000F94u, 32));
+            // Personaje controlado según el mapa RAM documentado.
+            values[72] = static_cast<jint>(character);
+
+           // MAPA THOR: posicion real del personaje y area activa, solo lectura.
+           // Formato:
+           // [0] valido
+           // [1] X24.8
+           // [2] Y24.8
+           // [3] camaraX
+           // [4] camaraY
+           // [5] areaIdA   (RAM 0x0300197C)
+           // [6] areaIdB   (RAM 0x0300197D)
+           // [7] areaRaw   (RAM 0x0300197C..0x0300197F, 32 bits)
+           // [8] areaEntry (RAM 0x03001980..0x03001983, puntero al registro activo)
+           jint map_values[kThorMapCount] = {};
+           const std::uint32_t map_actor = thor_read(0x03001B94u, 32);
+           if (map_actor >= 0x02000000u &&
+               map_actor <= 0x02040000u - 0x1A8u &&
+               thor_read(map_actor, 32) == 0x0804C9F0u) {
+               map_values[0] = 1;
+               map_values[1] = static_cast<jint>(
+                   thor_read(map_actor + 0x1A0u, 32));
+               map_values[2] = static_cast<jint>(
+                   thor_read(map_actor + 0x1A4u, 32));
+               map_values[3] = static_cast<jint>(
+                   thor_read(0x030019CCu, 32));
+               map_values[4] = static_cast<jint>(
+                   thor_read(0x030019D0u, 32));
+               const std::uint32_t area_raw =
+                   thor_read(0x0300197Cu, 32);
+               map_values[5] = static_cast<jint>(area_raw & 0xFFu);
+               map_values[6] = static_cast<jint>((area_raw >> 8) & 0xFFu);
+               map_values[7] = static_cast<jint>(
+                   thor_read(0x0300197Cu, 32));
+               map_values[8] = static_cast<jint>(
+                   thor_read(0x03001980u, 32));
+               // THOR_SCOUTER_DIMENSIONS_V1: campos originales, solo lectura.
+               map_values[9] = static_cast<jint>(
+                   thor_read(0x03001A38u, 32));
+               map_values[10] = static_cast<jint>(
+                   thor_read(0x03001A3Cu, 32));
+           }
+
+
+            // THOR: detectar un escenario jugable sin depender del widescreen.
+            const std::uint16_t dispcnt = bus.io().read16(0x000u);
+            bool field_ready =
+                (dispcnt & 7u) == 0u &&
+                (dispcnt & 0x1F40u) == 0x1F40u;
+
+            for (int bg = 0; bg < 4 && field_ready; ++bg) {
+                const std::uint16_t cnt =
+                    bus.io().read16(0x008u + bg * 2u);
+                field_ready =
+                    ((cnt >> 8) & 0x1Fu) == static_cast<unsigned>(28 + bg) &&
+                    ((cnt >> 14) & 3u) == 0u;
+            }
+
+            field_ready = field_ready && character < 9u &&
+                values[0] > 0 && values[1] > 0;
+
+            thor_ready_field_frames = field_ready
+                ? std::min(thor_ready_field_frames + 1, 12) : 0;
+
+            values[kThorGameplayReady] =
+                thor_ready_field_frames >= 12 ? 1 : 0;
+
+            // Habilidades: 9 personajes, 14 valores por personaje.
+           // [95 + 14*c]:
+           //  0 cantidad conocida
+           //  1..6 IDs de técnicas
+           //  7..12 niveles brutos por ranura
+           //  13 ranura seleccionada en el juego
+           // El registro de cada personaje ocupa 0x68 bytes.
+           const auto thor_read_byte = [&](uint32_t addr) -> jint {
+               const uint32_t word = thor_read(addr & ~1u, 16);
+               return static_cast<jint>(
+                   (word >> ((addr & 1u) * 8u)) & 0xFFu);
+           };
+
+           for (int character = 0; character < 9; ++character) {
+               const uint32_t rec =
+                   0x03001560u + static_cast<uint32_t>(character) * 0x68u;
+               const int out = 95 + character * 14;
+
+               values[out] = thor_read_byte(rec + 0x0Cu);
+
+               for (int slot = 0; slot < 6; ++slot) {
+                   values[out + 1 + slot] =
+                       thor_read_byte(rec + 0x0Du +
+                                      static_cast<uint32_t>(slot));
+
+                   values[out + 7 + slot] =
+                       thor_read_byte(rec + 0x2Eu +
+                                      static_cast<uint32_t>(slot * 2));
+               }
+
+               values[out + 13] = thor_read_byte(rec + 0x15u);
+           }
+
+           // Diario: 143 bytes de indicadores de progreso.
+           // RAM: 0x030010BD; snapshot: posiciones 221-363.
+           for (int i = 0; i < 143; ++i) {
+               values[221 + i] = thor_read_byte(
+                   0x030010BDu + static_cast<uint32_t>(i));
+           }
+
+           // Diagnóstico MAPA: ocho bytes de la estructura candidata.
+          // Snapshot [364..371], sin alterar las posiciones anteriores.
+          for (int i = 0; i < 8; ++i) {
+              values[364 + i] = thor_read_byte(
+                  0x0300197Cu + static_cast<uint32_t>(i));
+          }
+
+          // THOR-INVENTARIO-RAM: 84 bytes, solo lectura.
+          // Snapshot 372..455, RAM 0x03001069..0x030010BC.
+          for (int i = 0; i < 84; ++i) {
+              values[372 + i] = thor_read_byte(
+                  0x03001069u + static_cast<uint32_t>(i));
+          }
+
+            // THOR-EQUIPO-SNAPSHOT: records, effective attributes and slots.
+            const int equipment_count = std::min(kThorEquipmentCount,
+                thor_read_byte(0x0300114Cu));
+            values[456] = equipment_count;
+            for (int i = 0; i < 4 * equipment_count; ++i)
+                values[kThorEquipmentBase + i] = thor_read_byte(0x03001150u + i);
+
+            values[kThorEquipmentEpoch] = static_cast<jint>(g_runtime_state_epoch);
+            if (character < 9u) {
+                const uint32_t record = 0x03001560u + character * 0x68u;
+                // The original Status screen reads these recalculated halfwords.
+                constexpr uint32_t offsets[] = {0x4Cu, 0x4Eu, 0x50u, 0x54u};
+                for (int i = 0; i < 4; ++i) {
+                    values[kThorEffectiveStats + i] = thor_read(record + offsets[i], 16);
+                    values[kThorEquippedSlots + i] = thor_read(record + 0x3Cu + 4u * i, 32);
+                }
+            }
+
+          // Búsqueda diagnóstica, una sola vez en partida:
+            // 60 como byte, 675 como palabra.
+            if (!thor_probe_ready && values[1] > 0 && values[4] > 0) {
+                int count60 = 0;
+                int count675 = 0;
+                for (uint32_t addr = 0x03000000u;
+                     addr < 0x03008000u; addr += 2u) {
+                    const uint32_t word = thor_read(addr, 16);
+                    if ((word & 0xFFu) == 60u || (word >> 8) == 60u) {
+                        if (count60 < 10)
+                            thor_probe_candidates[2 + count60] =
+                                static_cast<jint>(addr +
+                                    ((word & 0xFFu) == 60u ? 0u : 1u));
+                        ++count60;
+                    }
+                    if (word == 675u) {
+                        if (count675 < 10)
+                            thor_probe_candidates[12 + count675] =
+                                static_cast<jint>(addr);
+                        ++count675;
+                    }
+                }
+                thor_probe_candidates[0] = count60;
+                thor_probe_candidates[1] = count675;
+                thor_probe_ready = true;
+            }
+            for (int i = 0; i < 22; ++i)
+                values[73 + i] = thor_probe_candidates[i];
+            // Independent ROM-backed Scouter. Read only on the game thread.
+            // Publish at 20 Hz, including clears on invalid actors/transitions.
+            const bool sample_original_map = status_frame % 3u == 0u;
+            bool original_map_valid = false;
+            if (sample_original_map && map_values[0] == 1) {
+                original_map_valid = thor_original_renderer.render(
+                    bus.rom_ptr(), bus.rom_size(), bus.iwram_ptr() + 0x1068u,
+                    static_cast<uint16_t>(map_values[7]), map_values[1],
+                    map_values[2], map_values[9], map_values[10],
+                    thor_original_pixels, status_frame);
+            }
+            {
+                std::lock_guard<std::mutex> lock(g_thor_status_mutex);
+                if (sample_original_map) {
+                    const size_t count = original_map_valid
+                        ? thor_original_pixels.size() : 0u;
+                    bool changed = g_thor_original_map.size() != count + 3u;
+                    if (!changed && original_map_valid) {
+                        changed = !std::equal(thor_original_pixels.begin(),
+                            thor_original_pixels.end(),
+                            g_thor_original_map.begin() + 3,
+                            [](uint32_t a, jint b) {
+                                return a == static_cast<uint32_t>(b);
+                            });
+                    }
+                    if (changed) {
+                        const jint revision = static_cast<jint>(
+                            (static_cast<uint32_t>(g_thor_original_map[0]) + 1u)
+                            & 0x7fffffffu);
+                        g_thor_original_map.resize(count + 3u);
+                        g_thor_original_map[0] = revision;
+                        g_thor_original_map[1] = original_map_valid
+                            ? thor_scouter::width : 0;
+                        g_thor_original_map[2] = original_map_valid
+                            ? thor_scouter::height : 0;
+                        if (original_map_valid)
+                            std::copy(thor_original_pixels.begin(),
+                                thor_original_pixels.end(),
+                                g_thor_original_map.begin() + 3);
+                    }
+                }
+                values[kThorEquipmentResponse] = g_thor_equipment_completed;
+                values[kThorEquipmentResponse + 1] = g_thor_equipment_result;
+                for (int i = 0; i < kThorStatusCount; ++i)
+                    g_thor_status[i] = values[i];
+                std::copy_n(map_values, kThorMapCount, g_thor_map);
+                g_thor_map_ready = true;
+                g_thor_status_ready = true;
+            }
+        }
+    };
+#endif
+
     // Re-assert enabled cheats once per guest frame. Called from both stepping
     // paths (the windowed/headless main loop and the TCP free-run step_frame).
     auto apply_cheats = [&]() {
+#if defined(__ANDROID__)
+        publish_thor_status();
+#endif
         if (!cheats_active || !cheat_engine.any_enabled()) return;
         const uint64_t cf = ppu.frame_count();
         if (cf != cheat_last_frame) {
@@ -1898,6 +2317,13 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
         const int port = std::atoi(e);
         if (port > 0 && port <= 65535) args.tcp_observe_port = port;
     }
+
+    // THOR_SCOUTER_DEBUG: observador grafico local para investigar
+    // los mapas originales sin modificar la ejecucion del juego.
+#if defined(__ANDROID__)
+    if (args.tcp_observe_port == 0)
+        args.tcp_observe_port = 38441;
+#endif
     if (const char* e = std::getenv("GBARECOMP_VIEW_ZOOM")) {
         const float z = static_cast<float>(std::atof(e));
         if (z >= 0.25f && z <= 4.0f) args.view_zoom = z;
@@ -2305,6 +2731,8 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
     // Step C margin sidecar — gated by the WIP kill-switch (force-disabled unless
     // GBARECOMP_WS_WIP=1) so the shipped build never arms the broken margin path.
     if (ws_wip_enabled) ws_sidecar_init_from_env();
+
+
 
     // ── Recompiler exec gate ──────────────────────────────────────
     //
@@ -3902,6 +4330,13 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
             input_record_last_value = recorded_keys;
         }
         if (ev.quit) host_quit = true;
+#if defined(__ANDROID__)
+        if (ev.quit || ev.enter_background || ev.terminating) {
+            thor_take_item_request();
+            std::lock_guard<std::mutex> lock(g_thor_status_mutex);
+            thor_cancel_equipment_request_locked();
+        }
+#endif
         if (ev.enter_background || ev.terminating) {
             // The OS may kill a backgrounded app without further notice:
             // persist the cartridge save, a suspend state and the session's
@@ -4210,6 +4645,9 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
 #endif
             waited = true;
             pump_host_input();
+#if defined(__ANDROID__)
+            thor_take_item_request();
+#endif
 #if defined(GBARECOMP_WEB_HOST)
             // The page re-presents its private staging copy; publishing here
             // would count paused frames as new ones.
@@ -4281,6 +4719,10 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
                 // Windowed present-in-place stays inside one step_once() for
                 // the whole session, so the outer loop's auto-flush never runs.
                 maybe_flush_battery(frame);
+#if defined(__ANDROID__)
+                // The runner may stay in this callback across guest frames.
+                publish_thor_status();
+#endif
                 if (phase_active) fp_t3 = FramePhaseRing::now_ns();
                 pump_host_input();
                 service_host_pause();
@@ -4687,6 +5129,61 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
                 pump_host_input();
                 if (phase_active) fp_t4 = FramePhaseRing::now_ns();
                 dispatches_since_pump = 0;
+
+#if defined(__ANDROID__)
+                // THOR_SCOUTER_CACHE: identificar la configuracion
+                // grafica del Scouter sin alterar la memoria del juego.
+                {
+                    const uint16_t display = bus.io().read16(0x000);
+                    const uint16_t bg0 = bus.io().read16(0x008);
+                    const uint16_t bg2 = bus.io().read16(0x00C);
+                    const uint16_t bg3 = bus.io().read16(0x00E);
+
+                    if ((display & 7u) == 0u &&
+                        (display & 0x0F00u) == 0x0D00u &&
+                        bg0 == 0x1D80u &&
+                        bg2 == 0x1E83u &&
+                        bg3 == 0x1F83u) {
+
+                        // THOR_SCOUTER_READY: exigir suficientes tiles
+                        // no vacios en el mapa BG2 antes de cachearlo.
+                        // La silueta original ocupa 122x66 pixeles.
+                        const uint8_t* vram = bus.vram_ptr();
+                        int tiles_visibles = 0;
+                        for (int i = 0; i < 1024; ++i) {
+                            const int pos = 0xF000 + i * 2;
+                            const uint16_t entrada =
+                                static_cast<uint16_t>(vram[pos]) |
+                                (static_cast<uint16_t>(vram[pos + 1]) << 8);
+                            if ((entrada & 1023u) != 0u)
+                                ++tiles_visibles;
+                        }
+
+                        if (tiles_visibles < 35)
+                            goto thor_scouter_cache_end;
+
+                        std::lock_guard<std::mutex> lock(g_thor_status_mutex);
+                        g_thor_scouter_cache.resize(
+                            kThorScouterTotalSize);
+
+                        std::memcpy(
+                            g_thor_scouter_cache.data(),
+                            bus.vram_ptr(), kThorScouterVramSize);
+
+                        std::memcpy(
+                            g_thor_scouter_cache.data() + kThorScouterVramSize,
+                            bus.pal_ptr(), kThorScouterPalSize);
+
+                        // THOR_SCOUTER_OAM: sprites originales del Scouter.
+                        std::memcpy(
+                            g_thor_scouter_cache.data() +
+                                kThorScouterVramSize + kThorScouterPalSize,
+                            bus.oam_ptr(), kThorScouterOamSize);
+                    }
+thor_scouter_cache_end:
+                    ;
+                }
+#endif
                 last_presented_frame = frame;
                 if (present_frame) {
                     ++frames_presented;
@@ -4742,6 +5239,8 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
         }
         // Battery-save auto-flush (policy at maybe_flush_battery). The TCP
         // debug path keeps exit-only flush.
+
+
         maybe_flush_battery(ppu.frame_count());
         if (!args.window && args.frames >= 0 &&
             ppu.frame_count() - headless_base_frame >=

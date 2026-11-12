@@ -10,6 +10,23 @@ package org.gbarecomp;
 public final class GbaNative {
     private GbaNative() {}
 
+    /** Read-only snapshot of the first character slot, or null before initialization. */
+    public static native int[] getStatusSnapshot();
+
+    /** Datos del mapa regional en tiempo real, solo lectura. */
+    public static native int[] getMapSnapshot();
+    public static native byte[] getScouterGraphics();
+    /** Original ROM-backed Scouter, [revision,width,height,ARGB...], null if unchanged. */
+    public static native int[] getOriginalScouterMap(int revision);
+
+    /** Solicita pulsaciones de L para cambiar la técnica activa. */
+    public static native void requestSkillCycles(int cycles);
+
+    /** Solicita utilizar un objeto del inventario original. */
+    public static native void requestUseItem(int itemId);
+    public static native int requestEquipmentChange(int character, int category,
+            int record, int itemId, int owner, int stateEpoch);
+
     /**
      * Safe-area insets in physical pixels: display cutouts and mandatory
      * system-gesture regions. Host chrome (touch pad, native buttons) is laid

@@ -77,6 +77,7 @@ bool mobile_prepare_process(std::vector<std::string>& args,
     // No compiler on the device: misses bridge loudly and are reported for
     // the offline heal loop instead of attempting an on-device rebuild.
     setenv("GBARECOMP_SELFHEAL_RECOMPILE", "0", 0);
+    setenv("GBARECOMP_MARGIN_CACHE", "0", 1); // TEMPORAL: diagnostico widescreen
     std::fprintf(stderr,
                  "mobile: storage=%s selfheal=report-only "
                  "(dispatch misses bridge loudly -> recomp_master_misses.toml.frag)\n",

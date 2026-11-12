@@ -204,6 +204,45 @@ bool camera_origin(gba::GbaBus* bus, int* w0x, int* w0y) {
 // Function-entry hook: maintain the per-tile owner ring from DrawMetatileAt.
 // Hot path — single compare for non-target PCs.
 extern "C" void ws_sidecar_fn_entry_hook(uint32_t pc) {
+
+#if defined(__ANDROID__)
+    // Diagnostico temporal de consumo de suministros.
+    // Observa cantidades sin escribir memoria del juego.
+    static bool primed = false;
+    static uint8_t previous[26] = {};
+    static uint32_t recent[64] = {};
+    static unsigned head = 0;
+    static unsigned recorded = 0;
+
+    recent[head] = pc;
+    head = (head + 1u) % 64u;
+    if (recorded < 64u) ++recorded;
+
+    if (gba::GbaBus* probe_bus = active_bus()) {
+        const uint8_t* current = probe_bus->iwram_ptr() + 0x106Au;
+        if (!primed) {
+            std::memcpy(previous, current, sizeof(previous));
+            primed = true;
+        } else if (std::memcmp(previous, current, sizeof(previous)) != 0) {
+            for (unsigned id = 0; id < 26u; ++id) {
+                if (current[id] < previous[id]) {
+                    std::fprintf(stderr,
+                        "[bf-item-probe] ID=%u cantidad=%u->%u entrada=0x%08X",
+                        id, unsigned(previous[id]), unsigned(current[id]), pc);
+                    std::fprintf(stderr, " funciones_recientes=");
+                    for (unsigned j = 0; j < recorded; ++j) {
+                        unsigned pos = (head + 64u - recorded + j) % 64u;
+                        std::fprintf(stderr, "%s%08X",
+                            j ? "," : "", recent[pos]);
+                    }
+                    std::fprintf(stderr, "\n");
+                    std::fflush(stderr);
+                }
+            }
+            std::memcpy(previous, current, sizeof(previous));
+        }
+    }
+#endif
     if (pc != g_dm_pc) return;
     if (g_in_active_fill) return;  // skip our own synthetic margin draws
     const uint32_t off = g_cpu.R[1] & kRingMask;     // ring tile offset (TL)

@@ -38,6 +38,7 @@ public class GbaGameActivity extends SDLActivity {
         setRequestedOrientation(orientationFor(config.orientation));
         try {
             installPayload();
+            validateInstalledPayload();
         } catch (IOException error) {
             throw new IllegalStateException("Unable to install game payload", error);
         }
@@ -56,6 +57,9 @@ public class GbaGameActivity extends SDLActivity {
         });
         enterImmersiveMode();
     }
+
+    /** Runs before SDL loads/starts native code, including direct/legacy launches. */
+    protected void validateInstalledPayload() throws IOException { }
 
     @Override
     public void onWindowFocusChanged(boolean hasFocus) {

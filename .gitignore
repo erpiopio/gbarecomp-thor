@@ -89,3 +89,8 @@ src/runtime/cover_embedded.h
 signing.local.properties
 *.jks
 *.keystore
+
+# Local development backups.
+*.bak-*
+*.pre-*
+*.backup-*

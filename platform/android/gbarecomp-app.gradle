@@ -103,6 +103,7 @@ android {
             gbaRomLabel: g.romLabel ?: "${g.title} ROM",
             gbaRomSha1: romShas.join(","),
             gbaRomSize: "${g.romSize}",
+            gbaRomSizes: (g.romSizes ?: [g.romSize]).join(","),
             gbaRomFile: g.romFile,
             gbaBiosRequired: "${g.biosRequired ?: false}",
             gbaBiosSha1: g.biosSha1 ?: "300c20df6731a33952ded8c436f7f186d25d3492",
@@ -213,7 +214,7 @@ tasks.register("stageGbarecompPayload", Sync) {
             rename { g.romFile }
         }
         doFirst {
-            if (!romFile.isFile() || romFile.length() != (g.romSize as long))
+            if (!romFile.isFile() || !(g.romSizes ?: [g.romSize]).collect { it as long }.contains(romFile.length()))
                 throw new GradleException("Private ROM must be the ${g.romSize}-byte dump")
             def sha = java.security.MessageDigest.getInstance("SHA-1")
                 .digest(romFile.bytes).encodeHex().toString()

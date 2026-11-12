@@ -194,6 +194,11 @@ struct RunOptions {
     const GbaEditField* edit_fields = nullptr;
     std::size_t edit_field_count = 0;
 
+    // Optional game-specific bus read policy before the first expanded view.
+    int (*initial_bus_read_override)(std::uint32_t pc, std::uint32_t address,
+                                    std::uint32_t width, std::uint32_t original,
+                                    std::uint32_t* out_value) = nullptr;
+
     // Optional game-owned content initializer. Called exactly once, after the
     // first non-native view has been authorized and applied. For a fixed view
     // that is during startup; for resize-driven view it is deferred until the

@@ -48,6 +48,7 @@
 #if defined(__ANDROID__)
 #include <atomic>
 #include <jni.h>
+#include <android/log.h>
 // Safe-area insets (display cutout + system bars) pushed from the Activity's
 // WindowInsets listener. The shared Android template declares the Java side
 // as org.gbarecomp.GbaNative.setSafeInsets(int left, int top, int right,
@@ -55,7 +56,34 @@
 namespace {
 std::atomic<int> g_android_insets[4] = {0, 0, 0, 0};
 std::atomic<bool> g_android_insets_known{false};
+std::atomic<int> g_thor_skill_cycles_pending{0};
+std::atomic<int> g_thor_item_request_pending{-1};
 }  // namespace
+// Petición táctil: cambiar técnica usando el botón L original.
+extern "C" JNIEXPORT void JNICALL
+Java_org_gbarecomp_GbaNative_requestSkillCycles(
+        JNIEnv*, jclass, jint cycles) {
+    if (cycles > 0 && cycles <= 8)
+        g_thor_skill_cycles_pending.store(
+            static_cast<int>(cycles), std::memory_order_relaxed);
+}
+
+// The Android UI posts one request. Guest code takes it on the game thread.
+extern "C" JNIEXPORT void JNICALL
+Java_org_gbarecomp_GbaNative_requestUseItem(
+        JNIEnv*, jclass, jint itemId) {
+    if (itemId < 0 || itemId >= 83)
+        return;
+
+    int empty = -1;
+    g_thor_item_request_pending.compare_exchange_strong(
+        empty, static_cast<int>(itemId), std::memory_order_relaxed);
+}
+
+int gbarecomp::thor_take_item_request() {
+    return g_thor_item_request_pending.exchange(-1, std::memory_order_relaxed);
+}
+
 extern "C" JNIEXPORT void JNICALL
 Java_org_gbarecomp_GbaNative_setSafeInsets(JNIEnv*, jclass, jint left, jint top,
                                            jint right, jint bottom) {
@@ -747,7 +775,20 @@ bool touch_input_enabled(const Backend* b) {
     return b && (b->touch_controls || b->touch_policy || b->touch_emulation);
 }
 
+bool pad_effectively_visible(const Backend* b) {
+    if (!b || !b->pad_visible || !b->touch_controls) return false;
+#if defined(__ANDROID__)
+    if (b->controller && SDL_GameControllerGetAttached(b->controller))
+        return false;
+#endif
+    return true;
+}
+
 bool pad_toggle_available(const Backend* b) {
+#if defined(__ANDROID__)
+    if (b && b->controller && SDL_GameControllerGetAttached(b->controller))
+        return false;
+#endif
     // The toggle is offered only when something other than the pad can drive
     // the game; a pad-only title must never be left without controls.
     return b && b->touch_policy && (b->touch_controls || b->touch_emulation);
@@ -776,7 +817,7 @@ Backend::TouchPoint* allocate_touch(Backend* b, SDL_FingerID id) {
 
 uint16_t active_touch_buttons(const Backend* b) {
     uint16_t buttons = 0;
-    if (!b) return buttons;
+    if (!pad_effectively_visible(b)) return buttons;
     for (const auto& touch : b->touches)
         if (touch.active && touch.pad) buttons |= touch.buttons;
     return buttons;
@@ -1006,7 +1047,7 @@ private:
 #endif
 
 void draw_touch_pad(Backend* b, HostOverlay& ov) {
-    if (!b->pad_visible || !b->touch_controls) return;
+    if (!pad_effectively_visible(b)) return;
     const PadLayout p = compute_pad_layout(b);
     const uint16_t held = active_touch_buttons(b);
     const auto S = OverlaySpace::Drawable;
@@ -1367,7 +1408,7 @@ void render_host_layers(Backend* b) {
     const bool menu_open = false;
 #endif
     const bool chrome = !menu_open &&
-        (b->host_overlay || (b->pad_visible && b->touch_controls) ||
+        (b->host_overlay || pad_effectively_visible(b) ||
          pad_toggle_available(b) || touch_input_enabled(b));
     if (!chrome && !menu_open) return;
 
@@ -2888,7 +2929,7 @@ HostWindow::Events HostWindow::pump() {
                     touch->x = touch->start_x = px;
                     touch->y = touch->start_y = py;
                     const uint16_t buttons =
-                        (b->pad_visible && b->touch_controls)
+                        pad_effectively_visible(b)
                             ? pad_buttons_at(pad, px, py, b->px_per_mm) : 0;
                     // The toggle wins over the pad so it can never be buried
                     // under a button (it is small and player-movable).
@@ -2910,7 +2951,7 @@ HostWindow::Events HostWindow::pump() {
                 touch->y = py;
                 if (touch->pad) {
                     // Sliding between pad buttons follows the finger.
-                    touch->buttons = pad_buttons_at(pad, px, py, b->px_per_mm);
+                    touch->buttons = pad_effectively_visible(b) ? pad_buttons_at(pad, px, py, b->px_per_mm) : 0;
                 } else if (touch->routed) {
                     route(e.type == SDL_FINGERUP ? TouchPhase::Up : TouchPhase::Move);
                 } else if (touch->toggle) {
@@ -3086,6 +3127,37 @@ HostWindow::Events HostWindow::pump() {
 #if defined(GBARECOMP_RUNTIME_UI)
     if (b->runtime_ui && recomp_runtime_ui_is_open(b->runtime_ui))
         ev.keyinput = 0x03FFu;
+#endif
+
+#if defined(__ANDROID__)
+    // Una pulsación L y, como mínimo, un fotograma de liberación.
+    // Respetar L físico y no enviar pulsaciones con el menú del motor abierto.
+    static bool thor_l_needs_release = false;
+    bool thor_allow_skill_input = true;
+#if defined(GBARECOMP_RUNTIME_UI)
+    thor_allow_skill_input =
+        !(b->runtime_ui && recomp_runtime_ui_is_open(b->runtime_ui));
+#endif
+
+    constexpr uint16_t THOR_L_BIT = 1u << 9;
+    const bool physical_l_released = (keys & THOR_L_BIT) != 0;
+
+    if (thor_allow_skill_input && physical_l_released) {
+        if (thor_l_needs_release) {
+            thor_l_needs_release = false;
+        } else {
+            int remaining =
+                g_thor_skill_cycles_pending.load(std::memory_order_relaxed);
+
+            if (remaining > 0) {
+                g_thor_skill_cycles_pending.fetch_sub(
+                    1, std::memory_order_relaxed);
+
+                ev.keyinput &= static_cast<uint16_t>(~THOR_L_BIT);
+                thor_l_needs_release = true;
+            }
+        }
+    }
 #endif
 
     int mouse_x = 0;

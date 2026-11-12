@@ -1,3 +1,7 @@
+#if defined(__ANDROID__)
+#include <android/log.h>
+#include <chrono>
+#endif
 // gba_bus.cpp — see gba_bus.h.
 //
 // Region dispatch follows `gba_memory.h::classify()` and uses the
@@ -424,6 +428,38 @@ bool GbaBus::observe_write(Region region, std::size_t off, uint32_t addr,
                                          width, old, new_value);
 }
 
+
+#if defined(__ANDROID__)
+extern "C" uint32_t runtime_current_pc(void);
+extern "C" uint32_t runtime_current_lr(void);
+// THOR_SCOUTER_CPU_TRACE: observar escrituras, sin alterar la VRAM.
+static void thor_trace_scouter_vram(
+        uint32_t addr, uint32_t value, int width) {
+    if (addr < 0x0600F000u || addr >= 0x0600F800u)
+        return;
+    if (value == 0u)
+        return; // THOR_SCOUTER_NONZERO: ignorar limpieza de VRAM.
+
+    using Clock = std::chrono::steady_clock;
+    static auto inicio = Clock::now();
+    static unsigned registros = 0;
+
+    const auto ahora = Clock::now();
+    if (ahora - inicio >= std::chrono::seconds(5)) {
+        inicio = ahora;
+        registros = 0;
+    }
+
+    if (registros++ >= 80)
+        return;
+
+    __android_log_print(
+        ANDROID_LOG_INFO, "THOR_SCOUTER_CPU",
+        "PC=0x%08X LR=0x%08X VRAM addr=0x%08X width=%d val=0x%08X",
+        runtime_current_pc(), runtime_current_lr(), addr, width, value);
+}
+#endif
+
 void GbaBus::write8(uint32_t addr, uint8_t v) {
     auto region = classify(addr);
     auto off    = resolve_offset(addr, region);
@@ -433,7 +469,10 @@ void GbaBus::write8(uint32_t addr, uint8_t v) {
         case Region::Iwram: iwram_[off] = v; return;
         case Region::Pal:   pal_[off]   = v; return;
         case Region::Vram:
-            if (off < vram_.size()) vram_[off] = v;
+            #if defined(__ANDROID__)
+           thor_trace_scouter_vram(addr, v, 1);
+#endif
+           if (off < vram_.size()) vram_[off] = v;
             return;
         case Region::Oam:   oam_[off] = v; return;
         case Region::Bios:
@@ -494,7 +533,10 @@ void GbaBus::write16(uint32_t addr, uint16_t v) {
         case Region::Iwram: store_u16(&iwram_[off], v); return;
         case Region::Pal:   store_u16(&pal_[off], v);   return;
         case Region::Vram:
-            if (off + 1 < vram_.size()) store_u16(&vram_[off], v);
+            #if defined(__ANDROID__)
+           thor_trace_scouter_vram(addr, v, 2);
+#endif
+           if (off + 1 < vram_.size()) store_u16(&vram_[off], v);
             return;
         case Region::Oam:   store_u16(&oam_[off], v); return;
         case Region::Bios:
@@ -521,6 +563,20 @@ void GbaBus::write16(uint32_t addr, uint16_t v) {
                 memctl_write(static_cast<uint32_t>(off), v, 2);
                 return;
             }
+#if defined(__ANDROID__)
+            // THOR_SCOUTER_IO_TRACE_V1: solo observa registros.
+            if ((off == 0x000u && (v & 0x0F07u) == 0x0D00u) ||
+                (off == 0x008u && v == 0x1D80u) ||
+                (off == 0x00Cu && v == 0x1E83u) ||
+                (off == 0x00Eu && v == 0x1F83u)) {
+                __android_log_print(
+                    ANDROID_LOG_INFO, "THOR_SCOUTER_IO",
+                    "PC=0x%08X LR=0x%08X REG=0x%03X VAL=0x%04X",
+                    runtime_current_pc(), runtime_current_lr(),
+                    static_cast<unsigned>(off),
+                    static_cast<unsigned>(v));
+            }
+#endif
             io_dispatch_.write16(static_cast<uint32_t>(off), v);
             note_io_write(static_cast<uint32_t>(off), 2);
             return;
@@ -574,7 +630,10 @@ void GbaBus::write32(uint32_t addr, uint32_t v) {
         case Region::Iwram: store_u32(&iwram_[off], v); return;
         case Region::Pal:   store_u32(&pal_[off], v);   return;
         case Region::Vram:
-            if (off + 3 < vram_.size()) store_u32(&vram_[off], v);
+            #if defined(__ANDROID__)
+           thor_trace_scouter_vram(addr, v, 4);
+#endif
+           if (off + 3 < vram_.size()) store_u32(&vram_[off], v);
             return;
         case Region::Oam:   store_u32(&oam_[off], v); return;
         case Region::Bios:

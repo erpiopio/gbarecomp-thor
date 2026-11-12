@@ -18,6 +18,7 @@ public final class GbaGameConfig {
     public final String romLabel;
     public final String[] romSha1;
     public final long romSize;
+    public final long[] romSizes;
     public final String romFile;
     public final boolean biosRequired;
     public final String biosSha1;
@@ -32,6 +33,11 @@ public final class GbaGameConfig {
         String shas = string(m, "gbarecomp.rom_sha1", "");
         romSha1 = shas.isEmpty() ? new String[0] : shas.toLowerCase(Locale.US).split(",");
         romSize = Long.parseLong(string(m, "gbarecomp.rom_size", "0"));
+        String sizes = string(m, "gbarecomp.rom_sizes", String.valueOf(romSize));
+        String[] parts = sizes.split(",");
+        romSizes = new long[parts.length];
+        for (int i = 0; i < parts.length; i++)
+            romSizes[i] = Long.parseLong(parts[i].trim());
         romFile = string(m, "gbarecomp.rom_file", "game.gba");
         biosRequired = Boolean.parseBoolean(string(m, "gbarecomp.bios_required", "false"));
         biosSha1 = string(m, "gbarecomp.bios_sha1",
@@ -56,6 +62,13 @@ public final class GbaGameConfig {
         } catch (PackageManager.NameNotFoundException error) {
             return new GbaGameConfig(null);
         }
+    }
+
+    public boolean romSizeAccepted(long size) {
+        for (long accepted : romSizes) {
+            if (accepted == size) return true;
+        }
+        return false;
     }
 
     public boolean romAccepted(String sha1) {
