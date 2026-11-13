@@ -74,6 +74,17 @@ public class GbaSetupActivity extends Activity {
 
     protected void validateImportedRom(String sha1, long size) throws IOException { }
 
+    /** Prepare game-specific resources before replacing the previous ROM. */
+    protected void prepareImportedRom(File temporary, String sha1, long size)
+            throws IOException { }
+
+    /** Optional migration for an already-installed cartridge. */
+    protected boolean needsInstalledRomPreparation(File rom) {
+        return false;
+    }
+
+    protected void prepareInstalledRom(File rom) throws IOException { }
+
     protected void onRomInstalled(File rom, String sha1, long size) { }
 
     @Override
@@ -89,6 +100,40 @@ public class GbaSetupActivity extends Activity {
         setContentView(buildContent());
         enterImmersiveMode();
         refreshStatus();
+
+        File existingRom = romFile();
+        if (existingRom.isFile() && needsInstalledRomPreparation(existingRom)) {
+            setBusy(true, "Preparing game maps...");
+
+            worker.execute(() -> {
+                try {
+                    prepareInstalledRom(existingRom);
+                    runOnUiThread(() -> {
+                        setBusy(false, null);
+                        refreshStatus();
+
+                        if (!ready()) {
+                            showError("Map preparation", "Maps are not ready.");
+                            return;
+                        }
+
+                        if (getIntent().getBooleanExtra(EXTRA_AUTOSTART, false)) {
+                            startActivity(new Intent(this, gameActivityClass()));
+                        } else if (skipLauncherOnBoot()) {
+                            launchGame();
+                        }
+                    });
+                } catch (Exception error) {
+                    runOnUiThread(() -> {
+                        setBusy(false, null);
+                        refreshStatus();
+                        showError("Map preparation failed", error.getMessage());
+                    });
+                }
+            });
+            return;
+        }
+
         if (!ready()) return;
         if (getIntent().getBooleanExtra(EXTRA_AUTOSTART, false)) {
             startActivity(new Intent(this, gameActivityClass()));
@@ -421,6 +466,14 @@ public class GbaSetupActivity extends Activity {
             throw new IOException(String.format(Locale.US,
                 "%s is not the supported clean %s dump.\n\nSize: %,d bytes (maximum %,d)\nSHA-1: %s",
                 displayName, bios ? "GBA BIOS" : config.romLabel, total, expectedSize, actual));
+        }
+        if (!bios) {
+            try {
+                prepareImportedRom(temporary, actual, total);
+            } catch (IOException | RuntimeException error) {
+                temporary.delete();
+                throw error;
+            }
         }
         try {
             // Same-directory POSIX rename replaces atomically. A failed import leaves
