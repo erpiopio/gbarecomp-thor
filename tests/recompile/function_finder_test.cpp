@@ -1350,6 +1350,83 @@ int main() {
             return 1;
         }
     }
+    // Relative virtual calls can prepare arguments after computing the
+    // callback target. Reject a clobber, branch or unknown call; stores and
+    // compares consume the target register without overwriting it.
+    for (unsigned before=0;before<2;++before) for (unsigned fault=0;fault<7;++fault) {
+        std::vector<uint8_t> image(0x400,0);
+        put16(image,0,0x480Fu); put16(image,2,0x4770u);
+        put32(image,0x40,kBase+0x200u);
+        for (unsigned n=0;n<2;++n) {
+            const unsigned pc=0x80u+n*0x20u;
+            put16(image,pc,n ? 0x688Au : 0x680Au);
+            if (before) {
+                put16(image,pc+2u,0x23FFu); // prepare a different argument
+                put16(image,pc+4u,0x3301u);
+            }
+            const unsigned gap=before*4u;
+            put16(image,pc+2u+gap,0x1851u); // target r1 = base r1 + offset r2
+            const uint16_t intervening[]={0x22FFu,0x2100u,0xE000u,
+                                          0xF000u,0x6001u,0x2900u,0xC802u};
+            put16(image,pc+4u+gap,intervening[fault]);
+            put16(image,pc+6u+gap,0x3221u);
+            put16(image,pc+8u+gap,0x5812u);
+            put_thumb_call(image,pc+10u+gap,0xE0u);
+        }
+        put16(image,0xB8u,0x4770u); put16(image,0xE0u,0x4708u);
+        put32(image,0x200u,0x101u);
+        put32(image,0x204u,0x141u); // never consumed
+        put32(image,0x208u,0x121u);
+        for (unsigned pc : {0x300u,0x320u,0x340u}) {
+            put16(image,pc,0xB510u);
+            for (unsigned k=2;k<10;k+=2) put16(image,pc+k,0x2001u);
+            put16(image,pc+10u,0xBD10u);
+        }
+        gbarecomp::FunctionFinder finder(image.data(),image.size(),kBase);
+        finder.set_speculative_literal_harvest(false);
+        finder.set_aot_scan_range(kBase+0x100u,kBase+0x400u);
+        finder.add_seed({kBase,gbarecomp::CpuMode::Thumb,"table_reference"});
+        finder.add_seed({kBase+0x80u,gbarecomp::CpuMode::Thumb,"delayed_relative_consumer"});
+        finder.run(128);
+        const bool expected=fault==0 || fault==4 || fault==5;
+        if (has_function(finder,kBase+0x300u,gbarecomp::CpuMode::Thumb)!=expected ||
+            has_function(finder,kBase+0x320u,gbarecomp::CpuMode::Thumb)!=expected ||
+            has_function(finder,kBase+0x340u,gbarecomp::CpuMode::Thumb)) {
+            std::fprintf(stderr,"Delayed relative callback failed: fault=%u\n",fault);
+            return 1;
+        }
+    }
+    // Small interfaces: destructor with a literal before PUSH, an empty
+    // callback and a constant-return callback. All three slots are consumed.
+    for (unsigned fault=0;fault<5;++fault) {
+        std::vector<uint8_t> image(0x400,0);
+        put16(image,0,0x480Fu);put16(image,2,0x4770u);
+        put32(image,0x40u,kBase+0x200u);
+        for (unsigned n=0;n<3;++n) {
+            const unsigned pc=0x80u+n*8u;
+            put16(image,pc,uint16_t(0x680Au+(n<<6)));
+            put16(image,pc+2u,0x1851u);
+            put_thumb_call(image,pc+4u,0xE0u);
+        }
+        put16(image,0x98u,0x4770u);put16(image,0xE0u,0x4708u);
+        put32(image,0x200u,0x101u);put32(image,0x204u,0x121u);
+        put32(image,0x208u,fault==1 ? 0x121u : 0x141u);
+        put16(image,0x300u,fault==2 ? 0x4C03u : 0x4A03u);
+        put16(image,0x302u,fault==3 ? 0xB400u : 0xB500u);
+        put16(image,0x304u,0x2000u);put16(image,0x306u,0xBD00u);
+        put16(image,0x320u,0x4770u);
+        put16(image,0x340u,fault==4 ? 0xDF00u : 0x2000u);
+        put16(image,0x342u,0x4770u);
+        gbarecomp::FunctionFinder finder(image.data(),image.size(),kBase);
+        finder.set_speculative_literal_harvest(false);
+        finder.set_aot_scan_range(kBase+0x100u,kBase+0x400u);
+        finder.add_seed({kBase,gbarecomp::CpuMode::Thumb,"small_table_reference"});
+        finder.add_seed({kBase+0x80u,gbarecomp::CpuMode::Thumb,"small_table_consumer"});
+        finder.run(128);
+        if (has_function(finder,kBase+0x340u,gbarecomp::CpuMode::Thumb)!=(fault==0)) {
+            std::fprintf(stderr,"Small relative interface failed: fault=%u\n",fault);return 1;
+        }
+    }
     // In a large image, the caller's wrong bias can still point into ROM.
     // A different declared code copy must supply the callee's source.
     std::vector<uint8_t> cross_image(0x01000200u,0xFFu);

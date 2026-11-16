@@ -419,14 +419,20 @@ void FunctionFinder::harvest_relative_callbacks() {
         const uint32_t first = base + read_u32(base);
         const auto strong = [&](uint32_t raw) {
             const auto target=raw & ~1u;
-            return (raw & 1u) && target >= aot_scan_start_ &&
-                uint64_t(target)+12u <= aot_scan_end_ &&
-                is_thumb_func_prologue(target) &&
-                looks_like_code(target,CpuMode::Thumb,true);
+            if (!(raw & 1u) || target<aot_scan_start_ ||
+                uint64_t(target)+12u>aot_scan_end_ ||
+                !looks_like_code(target,CpuMode::Thumb,true)) return false;
+            if (is_thumb_func_prologue(target)) return true;
+            // GCC destructors may load a replacement vtable into a caller-
+            // saved register immediately before saving LR. Both instructions
+            // are required; an arbitrary prefix does not qualify a table.
+            return can_read_at(target,4u) &&
+                (read_u16(target)&0xFC00u)==0x4800u &&
+                (read_u16(target+2u)&0xFF00u)==0xB500u;
         };
         if (!strong(first)) continue;
         std::vector<uint32_t> targets;
-        std::unordered_set<uint32_t> prologues;
+        std::unordered_set<uint32_t> prologues, leaves;
         for (uint32_t slot : slots) {
             if (!can_read_at(base+slot,4)) continue;
             const uint32_t raw=base+read_u32(base+slot);
@@ -436,14 +442,16 @@ void FunctionFinder::harvest_relative_callbacks() {
             if (strong(raw)) {
                 prologues.insert(target);
                 targets.push_back(target);
-            } else if (can_read_at(target,2) && read_u16(target)==0x4770u) {
-                targets.push_back(target); // exact BX LR leaf
+            } else if (is_thumb_callback_leaf(target)) {
+                leaves.insert(target);
+                targets.push_back(target);
             }
         }
-        // Only offsets actually consumed by a relative callback dispatcher are
-        // read. Two independent PUSH-LR entries corroborate the referenced base;
-        // there is no scan for a guessed table end or adjacent-table contents.
-        if (prologues.size()<2) continue;
+        // Only slots consumed by proved relative dispatchers contribute.
+        // Two independent frame-saving entries corroborate ordinary tables.
+        // Small interface tables can instead supply a destructor and two
+        // distinct return-proved leaves (e.g. empty update / false predicate).
+        if (prologues.size()<2 && !(prologues.size()==1 && leaves.size()>=2)) continue;
         for (uint32_t target : targets) {
             if (!aot_seen_seed_keys_.insert(visit_key(target,CpuMode::Thumb)).second)
                 continue;
@@ -2120,31 +2128,46 @@ void FunctionFinder::discover_one(uint32_t entry_addr, CpuMode entry_mode,
         }
 
         // Base-relative virtual callback: LDR offset,[base,#slot]; ADD target,
-        // base,offset; BL <BX-target veneer>. Capture the explicit slot only,
-        // including when the object supplies an unknown vtable base at runtime.
+        // base,offset; BL <BX-target veneer>. Compilers may prepare arguments
+        // before or after ADD. Prove both source registers survive until ADD,
+        // then prove the computed target survives until the consuming call.
         if (entry_mode == CpuMode::Thumb && aot_scan_start_ < aot_scan_end_ &&
             ins.op == armv4t::IrOp::LDR && !ins.mem.by_register &&
             ins.mem.pre_indexed && ins.mem.add && !ins.mem.writeback &&
             ins.mem.rn < 15 && ins.rd < 15 && ins.rd != ins.mem.rn &&
-            ins.mem.imm_offset <= 256u && (ins.mem.imm_offset & 3u)==0 &&
-            can_read_walk_at(pc+2,6)) {
-            const auto add=armv4t::ThumbDecoder::decode(read_walk_u16(pc+2),pc+2);
-            const auto hi=armv4t::ThumbDecoder::decode(read_walk_u16(pc+4),pc+4);
-            const auto lo=armv4t::ThumbDecoder::decode(read_walk_u16(pc+6),pc+6);
-            const auto& o=add.op2;
-            if (add.op==armv4t::IrOp::ADD && add.rd<15 &&
-                o.kind==armv4t::Op2::Kind::Shifted && !o.shifted.by_register &&
-                o.shifted.type==armv4t::ShiftType::LSL && o.shifted.imm_or_rs==0 &&
-                ((add.rn==ins.mem.rn && o.shifted.rm==ins.rd) ||
-                 (add.rn==ins.rd && o.shifted.rm==ins.mem.rn)) &&
-                hi.op==armv4t::IrOp::BL_prefix && lo.op==armv4t::IrOp::BL_suffix) {
-                const uint32_t target=(hi.branch_target+lo.swi_imm)&~1u;
-                if (can_read_at(target,2)) {
-                    const auto veneer=armv4t::ThumbDecoder::decode(read_u16(target),target);
-                    if (veneer.op==armv4t::IrOp::BX && veneer.rm==add.rd &&
-                        relative_callback_slots_.insert(ins.mem.imm_offset).second)
-                        relative_callbacks_dirty_=true;
+            ins.mem.imm_offset <= 256u && (ins.mem.imm_offset & 3u)==0) {
+            for (uint32_t at=pc+2u; at<=pc+20u && can_read_walk_at(at,2u); at+=2u) {
+                const auto add=armv4t::ThumbDecoder::decode(read_walk_u16(at),at);
+                const auto& o=add.op2;
+                const bool combines=add.op==armv4t::IrOp::ADD && add.rd<15 &&
+                    o.kind==armv4t::Op2::Kind::Shifted && !o.shifted.by_register &&
+                    o.shifted.type==armv4t::ShiftType::LSL && o.shifted.imm_or_rs==0 &&
+                    ((add.rn==ins.mem.rn && o.shifted.rm==ins.rd) ||
+                     (add.rn==ins.rd && o.shifted.rm==ins.mem.rn));
+                if (combines) {
+                    // This rejection budget never guesses a table extent or
+                    // promotes a pointer-shaped word without a consuming call.
+                    for (uint32_t call=at+2u; call<=at+22u && can_read_walk_at(call,2u); call+=2u) {
+                        const auto next=armv4t::ThumbDecoder::decode(read_walk_u16(call),call);
+                        if (next.op==armv4t::IrOp::BL_prefix && can_read_walk_at(call+2u,2u)) {
+                            const auto lo=armv4t::ThumbDecoder::decode(read_walk_u16(call+2u),call+2u);
+                            if (lo.op!=armv4t::IrOp::BL_suffix) break;
+                            const uint32_t target=(next.branch_target+lo.swi_imm)&~1u;
+                            if (can_read_at(target,2u)) {
+                                const auto veneer=armv4t::ThumbDecoder::decode(read_u16(target),target);
+                                if (veneer.op==armv4t::IrOp::BX && veneer.rm==add.rd &&
+                                    relative_callback_slots_.insert(ins.mem.imm_offset).second)
+                                    relative_callbacks_dirty_=true;
+                            }
+                            break;
+                        }
+                        if (next.is_undefined || next.is_branch || next.is_call ||
+                            may_clobber_register(next,add.rd)) break;
+                    }
+                    break;
                 }
+                if (add.is_undefined || add.is_branch || add.is_call ||
+                    may_clobber_register(add,ins.rd) || may_clobber_register(add,ins.mem.rn)) break;
             }
         }
 

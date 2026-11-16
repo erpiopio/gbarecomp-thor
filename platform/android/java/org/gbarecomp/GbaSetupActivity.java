@@ -67,6 +67,9 @@ public class GbaSetupActivity extends Activity {
         return GbaGameActivity.class;
     }
 
+    /** Game-specific resources generated from a verified ROM, on the worker. */
+    protected void prepareRomResources(File rom) throws IOException {}
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -82,7 +85,7 @@ public class GbaSetupActivity extends Activity {
         refreshStatus();
         if (!ready()) return;
         if (getIntent().getBooleanExtra(EXTRA_AUTOSTART, false)) {
-            startActivity(new Intent(this, gameActivityClass()));
+            launchGame();
         } else if (skipLauncherOnBoot()) {
             launchGame();
         }
@@ -345,7 +348,21 @@ public class GbaSetupActivity extends Activity {
             .putBoolean(SKIP_LAUNCHER_ON_BOOT,
                 skipLauncherCheck == null || skipLauncherCheck.isChecked())
             .apply();
-        startActivity(new Intent(this, gameActivityClass()));
+        setBusy(true, "Preparing game resources…");
+        worker.execute(() -> {
+            try {
+                prepareRomResources(romFile());
+                runOnUiThread(() -> {
+                    setBusy(false, null);
+                    startActivity(new Intent(this, gameActivityClass()));
+                });
+            } catch (Exception error) {
+                runOnUiThread(() -> {
+                    setBusy(false, null);
+                    showError("Game resources unavailable", error.getMessage());
+                });
+            }
+        });
     }
 
     private boolean skipLauncherOnBoot() {
@@ -404,6 +421,10 @@ public class GbaSetupActivity extends Activity {
             throw new IOException(String.format(Locale.US,
                 "%s is not the supported clean %s dump.\n\nSize: %,d bytes (expected %,d)\nSHA-1: %s",
                 displayName, bios ? "GBA BIOS" : config.romLabel, total, expectedSize, actual));
+        }
+        if (!bios) {
+            try { prepareRomResources(temporary); }
+            catch (IOException error) { temporary.delete(); throw error; }
         }
         if (destination.exists() && !destination.delete()) {
             temporary.delete();

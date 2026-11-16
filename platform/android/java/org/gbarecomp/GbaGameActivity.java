@@ -193,9 +193,15 @@ public class GbaGameActivity extends SDLActivity {
         }
     }
 
-    /** Files the player (or the running game) owns once they exist. */
+    /** Imported assets and runtime data belong to the player once present.
+     * A payload-version refresh may replace game TOML and packaged resources,
+     * but must never replace an imported cartridge, BIOS, or saved state.
+     */
     private static boolean isPlayerOwned(String name) {
-        return name.equals("state.toml") || name.endsWith(".sav") ||
-               name.equals("config.ini") || name.equals("keybinds.ini");
+        String lower = name.toLowerCase(java.util.Locale.ROOT);
+        return lower.equals("state.toml") || lower.endsWith(".sav") ||
+               lower.endsWith(".state") || lower.endsWith(".gba") ||
+               lower.equals("gba_bios.bin") || lower.equals("config.ini") ||
+               lower.equals("keybinds.ini");
     }
 }

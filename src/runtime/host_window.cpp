@@ -1549,7 +1549,8 @@ PresentationLayout current_presentation_layout(Backend* b, int* out_w, int* out_
         SDL_GetWindowSize(b->window, &drawable_w, &drawable_h);
     }
     PresentationLayout layout{};
-    if (b->resize_driven_view || b->expanded_view || b->touch_policy) {
+    if (b->resize_driven_view || b->expanded_view ||
+        b->touch_policy || !b->touch_controls) {
         // Responsive games fill the whole display (live rotation included);
         // touch-first games also fill it, since their controls are gestures.
         layout = compute_adaptive_presentation_layout(drawable_w, drawable_h,
@@ -1903,7 +1904,10 @@ bool HostWindow::open(int scale, int base_w, int base_h, const char* title,
     b->scale = scale;
     b->title = title ? title : "gbarecomp";
 #if defined(__ANDROID__)
-    b->touch_controls = true;
+    // Permitir desactivar el mando virtual en dispositivos
+    // con controles fisicos y pantalla secundaria.
+    const char* touch_env = std::getenv("GBARECOMP_TOUCH_CONTROLS");
+    b->touch_controls = !touch_env || (*touch_env && *touch_env != '0');
 #else
     if (const char* touch_env = std::getenv("GBARECOMP_TOUCH_CONTROLS"))
         b->touch_controls = *touch_env && *touch_env != '0';
